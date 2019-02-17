@@ -5,14 +5,17 @@
 #include <stdio.h>
 #include "tap-windows.h"
 
-HANDLE OpenTapDevice(const char* dev_node);
+HANDLE OpenTapDiagDevice(const char* dev_node);
 
 
 
 void PrintHelp(const char* programname)
 {
 	printf("%s Usage:\n", programname);
-	printf("  /link:[on|off] Change link state for TAP adapter\n");
+	printf("  /enable				Add registry key to enable TAP diag device\n");
+	printf("  /disable				Set registry key to disable TAP diag device\n");
+	printf("  /link:[on|off]		Change link state for TAP adapter\n");
+	printf("  /setq:[on|off|always] Configure adding of 802.1Q priority/vlan headers\n");
 
 
 }
@@ -22,41 +25,126 @@ int main(int argc, const char** argv)
     // Parse parameters
 	bool set_link = false;
 	bool link_on = false;
+	bool set_enable = false;
+	bool enable_value = false;
+	bool set_qos = false;
+	ULONG qos_value = 0;
 
 
 	for (int i = 1; i < argc; i++)
 	{
 		const char* arg = argv[i];
-		if (0 == strncmp(arg, "/link:", 6))
+		if (arg[0] == '-' || arg[0] == '/')
 		{
-			const char* part = arg + 6;
-			if (0 == strcmp(part, "on"))
+			arg++;
+			if (0 == strcmp(arg, "enable"))
 			{
-				set_link = true;
-				link_on = true;
+				set_enable = true;
+				enable_value = true;
+				continue;
 			}
-			else if (0 == strcmp(part, "off"))
+			else if (0 == strcmp(arg, "disable"))
 			{
-				set_link = true;
-				link_on = false;
+				set_enable = true;
+				enable_value = true;
+				continue;
 			}
-			else
+			else if (0 == strncmp(arg, "link:", 5))
 			{
-				printf("Unrecognized option: %s\n", arg);
-				PrintHelp(argv[0]);
-				return 1;
+				const char* part = arg + 5;
+				if (0 == strcmp(part, "on"))
+				{
+					set_link = true;
+					link_on = true;
+					continue;
+				}
+				else if (0 == strcmp(part, "off"))
+				{
+					set_link = true;
+					link_on = false;
+					continue;
+				}
+				else
+				{
+					printf("Unrecognized option: %s\n", arg);
+					PrintHelp(argv[0]);
+					return 1;
+				}
 			}
+			else if (0 == strncmp(arg, "setq:", 5))
+			{
+				const char* part = arg + 5;
+				if (0 == strcmp(part, "on"))
+				{
+					set_qos = true;
+					qos_value = TAP_PRIORITY_BEHAVIOR_ENABLED;
+					continue;
+				}
+				else if (0 == strcmp(part, "off"))
+				{
+					set_qos = true;
+					qos_value = TAP_PRIORITY_BEHAVIOR_NOPRIORITY;
+					continue;
+				}
+				else if (0 == strcmp(part, "always"))
+				{
+					set_qos = true;
+					qos_value = TAP_PRIORITY_BEHAVIOR_ADDALWAYS;
+					continue;
+				}
+				else
+				{
+					printf("Unrecognized option: %s\n", arg);
+					PrintHelp(argv[0]);
+					return 1;
+				}
+			}
+
+		}
+		printf("Unrecognized option: %s\n", arg);
+		PrintHelp(argv[0]);
+		return 1;
+	}
+
+
+	if (set_enable)
+	{
+		int exitcode = 1;
+		const char* regPath = "SYSTEM\\CurrentControlSet\\Services\\tap0901";
+		printf("Setting tapdiag enable flag...\n");
+		HKEY driverKey = NULL;
+
+		LONG result = RegOpenKeyEx(HKEY_LOCAL_MACHINE, regPath, 0, KEY_SET_VALUE, &driverKey);
+		if (result != ERROR_SUCCESS)
+		{
+			printf("Failed to open driver registry key. (%d)\n", result);
 		}
 		else
 		{
-			printf("Unrecognized option: %s\n", arg);
-			PrintHelp(argv[0]);
-			return 1;
+			DWORD newValue = enable_value ? 1 : 0;
+
+			result = RegSetValueEx(driverKey, "TapDiag", 0, REG_DWORD, (BYTE*)&newValue, sizeof(DWORD));
+
+			if (result == ERROR_SUCCESS)
+			{
+				printf("Successfully set enable flag.\n");
+				printf("HLKM:%s - TapDiag REG_DWORD = %d\n", regPath, newValue);
+				printf("\nNote: You must restart the tap driver for this to take effect!\n\n");
+				exitcode = 0;
+			}
+			else
+			{
+				printf("Failed to set registry value. (%d)\n", result);
+			}
+			RegCloseKey(driverKey);
 		}
+		return exitcode;
 	}
 
+
+
 	// Open device
-	HANDLE tap_device = OpenTapDevice(NULL);
+	HANDLE tap_device = OpenTapDiagDevice(NULL);
 	if (tap_device == INVALID_HANDLE_VALUE)
 	{
 		printf("Failed to open TAP device.\n");
@@ -65,9 +153,10 @@ int main(int argc, const char** argv)
 	printf("TAP Device opened.\n");
 
 	// Perform action
+
 	if (set_link)
 	{
-		DWORD mediaStatus = link_on ? 1 : 0;
+		ULONG mediaStatus = link_on ? 1 : 0;
 		DWORD bytesReturned = 0;
 
 		if (DeviceIoControl(tap_device, TAP_WIN_IOCTL_SET_MEDIA_STATUS,
@@ -83,6 +172,22 @@ int main(int argc, const char** argv)
 		}
 	}
 
+	if (set_qos)
+	{
+		DWORD bytesReturned = 0;
+
+		if (DeviceIoControl(tap_device, TAP_WIN_IOCTL_PRIORITY_BEHAVIOR,
+			&qos_value, sizeof(qos_value),
+			NULL, 0, &bytesReturned, NULL))
+		{
+			printf("Successfully set 802.1Q configuration.\n");
+		}
+		else
+		{
+			printf("Failed to set 802.1Q configuration\n");
+			return 1;
+		}
+	}
 
 
 	CloseHandle(tap_device);
@@ -230,7 +335,7 @@ get_tap_reg()
 }
 
 
-HANDLE OpenTapDevice(const char* dev_node)
+HANDLE OpenTapDiagDevice(const char* dev_node)
 {
 	HANDLE h = INVALID_HANDLE_VALUE;
 	char device_path[256];
@@ -241,7 +346,7 @@ HANDLE OpenTapDevice(const char* dev_node)
 	{
 		const struct tap_reg *tap_reg = get_tap_reg();
 		//const struct panel_reg *panel_reg = get_panel_reg();
-		char actual_buffer[256];
+		//char actual_buffer[256];
 
 		if (tap_reg == NULL)
 		{
@@ -305,7 +410,7 @@ HANDLE OpenTapDevice(const char* dev_node)
 				}
 
 				/* Open Windows TAP-Windows adapter */
-				snprintf(device_path, sizeof(device_path), "%s%s%s",
+				snprintf(device_path, sizeof(device_path), "%s%s%sdiag",
 					USERMODEDEVICEDIR,
 					device_guid,
 					TAP_WIN_SUFFIX);
